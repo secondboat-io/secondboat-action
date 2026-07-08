@@ -1,0 +1,38 @@
+
+name: 'SecondBoat IaC Scan'
+description: 'Scan your Terraform, CloudFormation, and more for security misconfigurations on every push.'
+author: 'SecondBoat'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'SecondBoat CI API Key'
+    required: true
+  org-id:
+    description: 'Your SecondBoat Organization ID'
+    required: true
+  api-url:
+    description: 'SecondBoat API endpoint'
+    required: false
+    default: 'https://5enet4z4rh.execute-api.us-east-1.amazonaws.com/prod/scan'
+  fail-on:
+    description: 'Minimum severity to fail the pipeline (CRITICAL, HIGH, MEDIUM, LOW, none)'
+    required: false
+    default: 'HIGH'
+  repo-token:
+    description: 'GitHub token for cloning the repository'
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  status:
+    description: 'Scan status (passed, failed, no_iac)'
+  total_failed:
+    description: 'Number of failed checks'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
