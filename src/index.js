@@ -1,4 +1,4 @@
-const core = require('@actions/core'); 
+const core = require('@actions/core');
 const github = require('@actions/github');
 const https = require('https');
 
@@ -29,8 +29,15 @@ async function run() {
   try {
     const apiKey = core.getInput('api-key', { required: true });
     const orgId = core.getInput('org-id', { required: true });
-    const apiUrl = core.getInput('api-url');
+    let apiUrl = core.getInput('api-url', { required: true });
     const failOn = core.getInput('fail-on') || 'HIGH';
+
+    // Auto-route to the streaming endpoint
+    if (apiUrl.endsWith('/scan')) {
+      apiUrl = apiUrl + '/stream';
+    } else if (!apiUrl.endsWith('/stream')) {
+      apiUrl = apiUrl + '/scan/stream';
+    }
 
     const ctx = github.context;
     const repoName = `${ctx.repo.owner}/${ctx.repo.repo}`;
@@ -40,8 +47,6 @@ async function run() {
     const scannedAt = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
     const commitMessage = ctx.payload.head_commit?.message || '';
 
-    // repo_token = GITHUB_TOKEN auto-injected by GitHub Actions — no user setup needed
-    // repo_id    = numeric repository ID, used for CI-first auto-registration
     const repoToken = core.getInput('repo-token') || process.env.GITHUB_TOKEN || '';
     const repoId = String(ctx.payload.repository?.id || '');
 
@@ -51,9 +56,9 @@ async function run() {
       branch,
       commit_sha: sha,
       commit_message: commitMessage,
-      repo_token: repoToken,   // GITHUB_TOKEN — Lambda uses this to clone if no App install
-      repo_id: repoId,      // numeric repo ID for CI-first auto-registration
-      repo_host: 'github',    // tells Lambda which Git host this is
+      repo_token: repoToken,
+      repo_id: repoId,
+      repo_host: 'github',
     });
 
     const url = new URL(apiUrl);
@@ -79,17 +84,72 @@ async function run() {
     core.info(`    Scanned At  : ${scannedAt}`);
     core.info(`    Fail On     : ${failOn}+`);
     blank();
+    core.info('  [📡] Connecting to SecondBoat Scanner...');
 
+    // ── The Real-Time SSE Stream Parser ──────────────────────────────────────────
     const body = await new Promise((resolve, reject) => {
       const req = https.request(options, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () =>
-          res.statusCode !== 200
-            ? reject(new Error(`HTTP ${res.statusCode}: ${data}`))
-            : resolve(JSON.parse(data))
-        );
+        let buffer = '';
+
+        if (res.statusCode !== 200) {
+          let errData = '';
+          res.on('data', chunk => errData += chunk);
+          res.on('end', () => reject(new Error(`HTTP ${res.statusCode}: ${errData}`)));
+          return;
+        }
+
+        res.on('data', chunk => {
+          buffer += chunk.toString();
+
+          // SSE messages end with \n\n. Parse complete messages from the buffer.
+          let boundary = buffer.indexOf('\n\n');
+          while (boundary !== -1) {
+            const message = buffer.slice(0, boundary);
+            buffer = buffer.slice(boundary + 2); // Remove parsed message from buffer
+
+            let eventType = 'message';
+            let eventData = '';
+
+            const lines = message.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('event:')) eventType = line.replace('event:', '').trim();
+              else if (line.startsWith('data:')) eventData = line.replace('data:', '').trim();
+            }
+
+            if (eventData) {
+              try {
+                // Parse the outer JSON wrapper from FastAPI
+                const parsed = JSON.parse(eventData);
+                const actualData = parsed.data;
+
+                // Handle the different real-time event types
+                if (eventType === 'accepted') {
+                  core.info(`  [🚀] ${actualData.message}`);
+                } else if (eventType === 'info' || eventType === 'success') {
+                  // Print real-time progress logs from the Lambda!
+                  core.info(`  [⏳] ${actualData}`);
+                } else if (eventType === 'error') {
+                  // Print real-time errors
+                  core.warning(`  [⚠️] ${actualData.message || actualData}`);
+                } else if (eventType === 'result') {
+                  // The scan is completely finished! Resolve the promise with the final payload
+                  core.info('  [✅] Scan process completed. Formatting report...');
+                  resolve(actualData);
+                }
+              } catch (e) {
+                // Ignore parsing errors for malformed chunks
+              }
+            }
+            boundary = buffer.indexOf('\n\n');
+          }
+        });
+
+        res.on('end', () => {
+          // If the stream closes before we get the 'result' event, something crashed heavily
+          reject(new Error('Connection closed by API Gateway before final result was received.'));
+        });
       });
+
       req.on('error', reject);
       req.write(payload);
       req.end();
@@ -104,41 +164,16 @@ async function run() {
       return;
     }
 
-    // ── Field paths — try all known variants ─────────────────────────────────
-    const secFindings = body.checkov_findings
-      || body.checkov?.findings
-      || body.findings
-      || [];
+    // ── Field paths — mapping to the newly updated Lambda return schema ────
+    const secFindings = body.checkov_findings || body.findings || [];
+    const secPassed = body.total_checkov_passed ?? 0;
+    const secFailed = body.total_checkov_failed ?? 0;
+    const secTotal = secPassed + secFailed;
 
-    const secPassed = body.total_checkov_passed
-      ?? body.checkov?.total_passed
-      ?? body.total_passed
-      ?? 0;
-
-    const secFailed = body.total_checkov_failed
-      ?? body.checkov?.total_failed
-      ?? body.total_failed
-      ?? 0;
-
-    const secTotal = body.total_checkov_checks
-      ?? body.checkov?.total_checks
-      ?? body.total_checks
-      ?? (secPassed + secFailed);
-
-    const govFindings = body.governance_findings
-      || body.governance?.findings
-      || [];
-
-    const govPassed = body.total_governance_passed
-      ?? body.governance?.total_passed
-      ?? 0;
-
-    const govFailed = body.total_governance_failed
-      ?? body.governance?.total_failed
-      ?? 0;
-
+    const govFindings = body.governance_findings || [];
+    const govPassed = body.total_governance_passed ?? 0;
+    const govFailed = body.total_governance_failed ?? 0;
     const govTotal = govPassed + govFailed;
-
 
     // ══════════════════════════════════════════════════════════════════════════
     //  SECTION 1 — SECURITY FINDINGS
@@ -146,13 +181,11 @@ async function run() {
     heading('SECTION 1 of 2  ·  SECURITY FINDINGS');
     core.info(`    ✅  Passed : ${secPassed}    ❌  Failed : ${secFailed}    📊  Total : ${secTotal}`);
 
-
     if (secFailed === 0) {
       blank();
       core.info('  🎉  All security checks passed — no violations found');
     } else {
       blank();
-
       const failedSec = secFindings.filter(f => !f.status || f.status === 'FAILED');
       failedSec.forEach((f, idx) => {
         const num = String(idx + 1).padStart(2, '0');
@@ -162,7 +195,6 @@ async function run() {
           f.line_start ? `:${f.line_start}` : '',
           f.line_end && f.line_end !== f.line_start ? `-${f.line_end}` : '',
         ].join('');
-
 
         divider();
         core.info(`  [${num}]  ${f.check_id || 'N/A'}${sev ? `   ${sev}` : ''}`);
@@ -176,13 +208,11 @@ async function run() {
       });
     }
 
-
     // ══════════════════════════════════════════════════════════════════════════
     //  SECTION 2 — GOVERNANCE FINDINGS
     // ══════════════════════════════════════════════════════════════════════════
     heading('SECTION 2 of 2  ·  GOVERNANCE FINDINGS');
     core.info(`    ✅  Passed : ${govPassed}    ❌  Failed : ${govFailed}    📊  Total : ${govTotal}`);
-
 
     if (govTotal === 0) {
       blank();
@@ -197,48 +227,25 @@ async function run() {
         SEVERITY_ORDER.indexOf(getSeverity(b)) - SEVERITY_ORDER.indexOf(getSeverity(a))
       );
 
-
       sorted.forEach((f, idx) => {
         const num = String(idx + 1).padStart(2, '0');
         const sev = sevBadge(f);
 
-
         divider();
-        core.info(`  [${num}]  ${f.policy_title || 'N/A'}${sev ? `   ${sev}` : ''}`);
+        core.info(`  [${num}]  ${f.policy_title || f.check_id || 'N/A'}${sev ? `   ${sev}` : ''}`);
         divider();
         core.info(`         Resource      : ${f.resource || 'N/A'}`);
-        core.info(`         Resource Type : ${f.resource_type || 'N/A'}`);
-
-        // Fallback for older lambda payload or new payload
-        const conditions = f.evaluated_conditions || f.failed_conditions || [];
-
-        if (conditions.length > 0) {
-          blank();
-          core.info(`         Conditions Evaluated:`);
-          conditions.forEach(c => {
-            const checkIcon = (c.status === 'PASSED') ? '✅' : '❌';
-            const checkName = c.check_id || c.key || 'Unknown Check';
-
-            core.info(`           ${checkIcon} ${checkName}`);
-
-            // Only print Expected/Actual details if the check actually failed
-            if (c.status !== 'PASSED') {
-              core.info(`               Expected : ${c.operator} "${c.expected}"`);
-              core.info(`               Actual   : "${c.actual}"`);
-            }
-          });
-        }
+        core.info(`         Scope         : ${f.scope || 'N/A'}`);
+        core.info(`         Status/Reason : ${f.reason || 'N/A'}`);
         blank();
       });
     }
-
 
     // ══════════════════════════════════════════════════════════════════════════
     //  SUMMARY
     // ══════════════════════════════════════════════════════════════════════════
     const totalFailed = secFailed + govFailed;
     const totalPassed = secPassed + govPassed;
-
 
     blank();
     core.info(L('━'));
@@ -250,7 +257,6 @@ async function run() {
     core.info(`    📊  Total Checks   : ${totalPassed + totalFailed}`);
     core.info(`    🎯  Fail Threshold : ${failOn}`);
 
-
     if (govFailed > 0) {
       blank();
       core.info('    Governance Severity Breakdown:');
@@ -261,29 +267,29 @@ async function run() {
       });
     }
 
-
     blank();
     core.info(L('━'));
     blank();
 
-
     // ── FAIL GATE ─────────────────────────────────────────────────────────────
-    const govShouldFail = failOn !== 'none' && govFindings.some(f =>
+    const shouldFailSec = secFindings.some(f =>
+      (!f.status || f.status === 'FAILED') &&
+      SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn)
+    );
+
+    const shouldFailGov = govFindings.some(f =>
       f.status === 'FAILED' &&
       SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn)
     );
 
-
-    if (govShouldFail) {
-      core.setFailed(`❌  SecondBoat found governance violations at or above ${failOn} severity`);
-    } else if (govFailed > 0) {
-      core.warning(`⚠️   Governance violations found but all below ${failOn} threshold — pipeline continues`);
+    if (failOn !== 'none' && (shouldFailSec || shouldFailGov)) {
+      core.setFailed(`❌  SecondBoat found violations at or above ${failOn} severity`);
+    } else if (totalFailed > 0) {
+      core.warning(`⚠️   Violations found but all below ${failOn} threshold — pipeline continues`);
     }
-
 
     core.setOutput('status', body.status);
     core.setOutput('total_failed', String(totalFailed));
-
 
   } catch (err) {
     core.setFailed(`SecondBoat scan failed: ${err.message}`);
