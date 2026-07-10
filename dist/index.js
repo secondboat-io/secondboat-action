@@ -31868,56 +31868,39 @@ async function run() {
     let apiUrl = core.getInput('api-url', { required: true });
     const failOn = core.getInput('fail-on') || 'HIGH';
 
-    // Auto-route to the streaming endpoint
-    if (apiUrl.endsWith('/scan')) {
-      apiUrl = apiUrl + '/stream';
-    } else if (!apiUrl.endsWith('/stream')) {
-      apiUrl = apiUrl + '/scan/stream';
-    }
+    if (apiUrl.endsWith('/')) apiUrl = apiUrl.slice(0, -1);
+    if (apiUrl.endsWith('/scan')) apiUrl = apiUrl + '/stream';
+    else if (!apiUrl.endsWith('/stream') && !apiUrl.endsWith('/scan/stream')) apiUrl = apiUrl + '/scan/stream';
 
     const ctx = github.context;
     const repoName = `${ctx.repo.owner}/${ctx.repo.repo}`;
     const branch = ctx.ref.replace('refs/heads/', '');
     const sha = ctx.sha;
     const shortSha = sha.slice(0, 7);
-    const scannedAt = new Date().toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
     const commitMessage = ctx.payload.head_commit?.message || '';
 
     const repoToken = core.getInput('repo-token') || process.env.GITHUB_TOKEN || '';
     const repoId = String(ctx.payload.repository?.id || '');
 
     const payload = JSON.stringify({
-      org_id: orgId,
-      repo_name: repoName,
-      branch,
-      commit_sha: sha,
-      commit_message: commitMessage,
-      repo_token: repoToken,
-      repo_id: repoId,
-      repo_host: 'github',
+      org_id: orgId, repo_name: repoName, branch, commit_sha: sha,
+      commit_message: commitMessage, repo_token: repoToken, repo_id: repoId, repo_host: 'github'
     });
 
     const url = new URL(apiUrl);
     const options = {
-      hostname: url.hostname,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': apiKey,
-        'Content-Length': Buffer.byteLength(payload),
-      },
+      hostname: url.hostname, path: url.pathname, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'Content-Length': Buffer.byteLength(payload) },
     };
 
     blank();
     core.info(L('━'));
-    core.info('  ⚓  SECONDBOAT  —  IaC SECURITY SCAN REPORT');
+    core.info('  ⚓  SECONDBOAT SCAN REPORT');
     core.info(L('━'));
     blank();
     core.info(`    Repository  : ${repoName}`);
     core.info(`    Branch      : ${branch}`);
     core.info(`    Commit      : ${shortSha}`);
-    core.info(`    Scanned At  : ${scannedAt}`);
     core.info(`    Fail On     : ${failOn}+`);
     blank();
     core.info('  [📡] Connecting to SecondBoat Scanner...');
@@ -31926,7 +31909,6 @@ async function run() {
     const body = await new Promise((resolve, reject) => {
       const req = https.request(options, (res) => {
         let buffer = '';
-
         if (res.statusCode !== 200) {
           let errData = '';
           res.on('data', chunk => errData += chunk);
@@ -31936,54 +31918,36 @@ async function run() {
 
         res.on('data', chunk => {
           buffer += chunk.toString();
-
-          // SSE messages end with \n\n. Parse complete messages from the buffer.
           let boundary = buffer.indexOf('\n\n');
           while (boundary !== -1) {
             const message = buffer.slice(0, boundary);
-            buffer = buffer.slice(boundary + 2); // Remove parsed message from buffer
+            buffer = buffer.slice(boundary + 2);
 
             let eventType = 'message';
             let eventData = '';
-
-            const lines = message.split('\n');
-            for (const line of lines) {
+            for (const line of message.split('\n')) {
               if (line.startsWith('event:')) eventType = line.replace('event:', '').trim();
               else if (line.startsWith('data:')) eventData = line.replace('data:', '').trim();
             }
 
             if (eventData) {
               try {
-                // Parse the outer JSON wrapper from FastAPI
                 const parsed = JSON.parse(eventData);
                 const actualData = parsed.data;
-
-                // Handle the different real-time event types
-                if (eventType === 'accepted') {
-                  core.info(`  [🚀] ${actualData.message}`);
-                } else if (eventType === 'info' || eventType === 'success') {
-                  // Print real-time progress logs from the Lambda!
-                  core.info(`  [⏳] ${actualData}`);
-                } else if (eventType === 'error') {
-                  // Print real-time errors
-                  core.warning(`  [⚠️] ${actualData.message || actualData}`);
-                } else if (eventType === 'result') {
-                  // The scan is completely finished! Resolve the promise with the final payload
-                  core.info('  [✅] Scan process completed. Formatting report...');
+                if (eventType === 'accepted') core.info(`  [🚀] ${actualData.message}`);
+                else if (eventType === 'info' || eventType === 'success') core.info(`  [⏳] ${actualData}`);
+                else if (eventType === 'error') core.warning(`  [⚠️] ${actualData.message || actualData}`);
+                else if (eventType === 'result') {
+                  core.info('  [✅] Formatting final report...');
                   resolve(actualData);
                 }
-              } catch (e) {
-                // Ignore parsing errors for malformed chunks
-              }
+              } catch (e) { }
             }
             boundary = buffer.indexOf('\n\n');
           }
         });
 
-        res.on('end', () => {
-          // If the stream closes before we get the 'result' event, something crashed heavily
-          reject(new Error('Connection closed by API Gateway before final result was received.'));
-        });
+        res.on('end', () => reject(new Error('Connection closed prematurely.')));
       });
 
       req.on('error', reject);
@@ -31991,141 +31955,134 @@ async function run() {
       req.end();
     });
 
-    core.debug(`[SecondBoat] Response keys: ${Object.keys(body).join(', ')}`);
-
     if (body.status === 'no_iac') {
-      core.warning('  ⚠️   No IaC files detected in this repository');
-      core.setOutput('status', 'no_iac');
-      core.setOutput('total_failed', '0');
+      core.warning('  ⚠️   No infrastructure files detected in this repository');
       return;
     }
 
-    // ── Field paths — mapping to the newly updated Lambda return schema ────
-    const secFindings = body.checkov_findings || body.findings || [];
-    const secPassed = body.total_checkov_passed ?? 0;
-    const secFailed = body.total_checkov_failed ?? 0;
-    const secTotal = secPassed + secFailed;
+    // ── Field paths ───────────────────────────────────────────────────────────
+    const secFindings = body.checkov_findings || [];
+    const allGovFindings = body.governance_findings || [];
 
-    const govFindings = body.governance_findings || [];
-    const govPassed = body.total_governance_passed ?? 0;
-    const govFailed = body.total_governance_failed ?? 0;
-    const govTotal = govPassed + govFailed;
+    const cloudGov = allGovFindings.filter(f => f.scope === 'cloud');
+    const scGov = allGovFindings.filter(f => f.scope === 'supply_chain');
+
+    const cveSummary = body.cve_summary || {};
+    const cveCriticals = body.cve_criticals || [];
+    const sbomSummary = body.sbom_summary || {};
+
+    let totalFailed = 0;
+
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  SECTION 1 — SECURITY FINDINGS
+    //  1. CLOUD INFRASTRUCTURE ADVISOR (Checkov)
     // ══════════════════════════════════════════════════════════════════════════
-    heading('SECTION 1 of 2  ·  SECURITY FINDINGS');
-    core.info(`    ✅  Passed : ${secPassed}    ❌  Failed : ${secFailed}    📊  Total : ${secTotal}`);
+    heading('1. Cloud Infrastructure Advisor');
+    const failedSec = secFindings.filter(f => !f.status || f.status === 'FAILED');
 
-    if (secFailed === 0) {
-      blank();
-      core.info('  🎉  All security checks passed — no violations found');
+    if (failedSec.length === 0) {
+      core.info('  🎉  All security checks passed — no infrastructure violations found');
     } else {
-      blank();
-      const failedSec = secFindings.filter(f => !f.status || f.status === 'FAILED');
+      totalFailed += failedSec.length;
       failedSec.forEach((f, idx) => {
         const num = String(idx + 1).padStart(2, '0');
         const sev = sevBadge(f);
-        const location = [
-          f.file_path || '',
-          f.line_start ? `:${f.line_start}` : '',
-          f.line_end && f.line_end !== f.line_start ? `-${f.line_end}` : '',
-        ].join('');
+        const location = [f.file_path || '', f.line_start ? `:${f.line_start}` : ''].join('');
 
         divider();
         core.info(`  [${num}]  ${f.check_id || 'N/A'}${sev ? `   ${sev}` : ''}`);
         divider();
         core.info(`         Check     : ${f.check_name || 'N/A'}`);
-        core.info(`         Severity  : ${sev || 'N/A'}`);
         core.info(`         Resource  : ${f.resource || 'N/A'}`);
-        core.info(`         Framework : ${f.framework || 'N/A'}`);
         core.info(`         File      : ${location || 'N/A'}`);
         blank();
       });
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  SECTION 2 — GOVERNANCE FINDINGS
+    //  2. CLOUD INFRASTRUCTURE VIOLATIONS (Custom Cloud Policies)
     // ══════════════════════════════════════════════════════════════════════════
-    heading('SECTION 2 of 2  ·  GOVERNANCE FINDINGS');
-    core.info(`    ✅  Passed : ${govPassed}    ❌  Failed : ${govFailed}    📊  Total : ${govTotal}`);
+    heading('2. Cloud Infrastructure Violations');
 
-    if (govTotal === 0) {
-      blank();
-      core.info('  ℹ️   No governance policies configured for this repository');
-    } else if (govFailed === 0) {
-      blank();
-      core.info('  🎉  All governance policies passed');
+    if (cloudGov.length === 0) {
+      core.info('  ℹ️   No custom cloud policies configured.');
     } else {
-      blank();
-      const failedGov = govFindings.filter(f => f.status === 'FAILED');
-      const sorted = [...failedGov].sort((a, b) =>
-        SEVERITY_ORDER.indexOf(getSeverity(b)) - SEVERITY_ORDER.indexOf(getSeverity(a))
-      );
-
-      sorted.forEach((f, idx) => {
-        const num = String(idx + 1).padStart(2, '0');
-        const sev = sevBadge(f);
-
-        divider();
-        core.info(`  [${num}]  ${f.policy_title || f.check_id || 'N/A'}${sev ? `   ${sev}` : ''}`);
-        divider();
-        core.info(`         Resource      : ${f.resource || 'N/A'}`);
-        core.info(`         Scope         : ${f.scope || 'N/A'}`);
-        core.info(`         Status/Reason : ${f.reason || 'N/A'}`);
+      cloudGov.forEach(f => {
+        if (f.status === 'FAILED') {
+          totalFailed += 1;
+          core.info(`  ❌  ${f.policy_title || 'Unknown Policy'} (${f.resource})`);
+          core.info(`       ↳ Reason: ${f.reason || 'Not compliant'}`);
+        } else if (f.status === 'PASSED') {
+          core.info(`  ✅  ${f.policy_title || 'Unknown Policy'} (${f.resource})`);
+        } else {
+          core.info(`  ⚪  ${f.policy_title || 'Unknown Policy'} (Skipped)`);
+        }
         blank();
       });
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  SUMMARY
+    //  3. SUPPLY CHAIN ADVISOR (Grype/Syft)
     // ══════════════════════════════════════════════════════════════════════════
-    const totalFailed = secFailed + govFailed;
-    const totalPassed = secPassed + govPassed;
+    heading('3. Supply Chain Advisor');
 
-    blank();
-    core.info(L('━'));
-    core.info('  SCAN SUMMARY');
-    core.info(L('━'));
-    blank();
-    core.info(`    ✅  Passed         : ${totalPassed}`);
-    core.info(`    ❌  Failed         : ${totalFailed}`);
-    core.info(`    📊  Total Checks   : ${totalPassed + totalFailed}`);
-    core.info(`    🎯  Fail Threshold : ${failOn}`);
+    const totalPkg = sbomSummary.total_packages || 0;
+    const totalVuln = cveSummary.total || 0;
+    const fixableVuln = cveSummary.fixable || 0;
 
-    if (govFailed > 0) {
+    core.info(`    📦 Packages Scanned       : ${totalPkg}`);
+    core.info(`    🛡️ Total Vulnerabilities  : ${totalVuln} (${fixableVuln} fixes available)`);
+
+    if (cveCriticals.length > 0) {
+      totalFailed += cveCriticals.length; // Count critical CVEs towards the failure limit
       blank();
-      core.info('    Governance Severity Breakdown:');
-      const failedGov = govFindings.filter(f => f.status === 'FAILED');
-      [...SEVERITY_ORDER].reverse().forEach(sev => {
-        const count = failedGov.filter(f => getSeverity(f) === sev).length;
-        if (count) core.info(`      ${SEVERITY_ICON[sev]}  ${sev.padEnd(8)} : ${count}`);
+      core.info(`    🚨 CRITICAL VULNERABILITIES DETECTED:`);
+      cveCriticals.forEach(c => {
+        core.info(`         🔴 ${c.package}@${c.version}  ->  ${c.id}`);
+      });
+    } else {
+      blank();
+      core.info(`    ✅ No CRITICAL vulnerabilities found in the supply chain.`);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  4. SUPPLY CHAIN VIOLATIONS (Custom Supply Chain Policies)
+    // ══════════════════════════════════════════════════════════════════════════
+    heading('4. Supply Chain Violations');
+
+    if (scGov.length === 0) {
+      core.info('  ℹ️   No custom supply chain policies configured.');
+    } else {
+      scGov.forEach(f => {
+        if (f.status === 'FAILED') {
+          totalFailed += 1;
+          core.info(`  ❌  ${f.policy_title || f.check_id} (${f.resource})`);
+          core.info(`       ↳ Cause: ${f.reason}`);
+        } else if (f.status === 'PASSED') {
+          core.info(`  ✅  ${f.policy_title || f.check_id} (${f.resource})`);
+        } else {
+          core.info(`  ⚪  ${f.policy_title || f.check_id} (Skipped)`);
+        }
+        blank();
       });
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    //  PIPELINE FAIL GATE
+    // ══════════════════════════════════════════════════════════════════════════
     blank();
     core.info(L('━'));
-    blank();
 
-    // ── FAIL GATE ─────────────────────────────────────────────────────────────
-    const shouldFailSec = secFindings.some(f =>
-      (!f.status || f.status === 'FAILED') &&
-      SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn)
-    );
+    // Simple Check: Does anything exceed the fail threshold?
+    const shouldFailSec = failedSec.some(f => SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn));
+    const shouldFailGov = allGovFindings.some(f => f.status === 'FAILED' && SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn));
+    const shouldFailSC = cveCriticals.length > 0 && failOn !== 'none'; // Critical CVEs always trigger a pipeline fail if failOn is active
 
-    const shouldFailGov = govFindings.some(f =>
-      f.status === 'FAILED' &&
-      SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn)
-    );
-
-    if (failOn !== 'none' && (shouldFailSec || shouldFailGov)) {
-      core.setFailed(`❌  SecondBoat found violations at or above ${failOn} severity`);
+    if (failOn !== 'none' && (shouldFailSec || shouldFailGov || shouldFailSC)) {
+      core.setFailed(`❌ SecondBoat found violations at or above the ${failOn} severity threshold.`);
     } else if (totalFailed > 0) {
-      core.warning(`⚠️   Violations found but all below ${failOn} threshold — pipeline continues`);
+      core.warning(`⚠️ Violations found but they are below the ${failOn} threshold. Pipeline continues.`);
     }
-
-    core.setOutput('status', body.status);
-    core.setOutput('total_failed', String(totalFailed));
 
   } catch (err) {
     core.setFailed(`SecondBoat scan failed: ${err.message}`);
