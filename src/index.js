@@ -134,13 +134,21 @@ async function run() {
     const cveCriticals = body.cve_criticals || [];
     const sbomSummary = body.sbom_summary || {};
 
-    let totalFailed = 0;
+    const secPassed = body.total_checkov_passed ?? 0;
+    const secFailed = body.total_checkov_failed ?? 0;
+    const secTotal = secPassed + secFailed;
 
+    let totalFailed = 0;
 
     // ══════════════════════════════════════════════════════════════════════════
     //  1. CLOUD INFRASTRUCTURE ADVISOR (Grouped & Deduplicated)
     // ══════════════════════════════════════════════════════════════════════════
     heading('1. Cloud Infrastructure Advisor');
+    
+    // --- SUMMARY INJECTED HERE ---
+    core.info(`    ✅  Passed : ${secPassed}    ❌  Failed : ${secFailed}    📊  Total : ${secTotal}`);
+    blank();
+
     const failedSec = secFindings.filter(f => !f.status || f.status === 'FAILED');
     
     if (failedSec.length === 0) {
@@ -201,6 +209,11 @@ async function run() {
     if (cloudGov.length === 0) {
       core.info('  ℹ️   No custom cloud policies configured.');
     } else {
+      let cgPassed = 0, cgFailed = 0;
+      cloudGov.forEach(f => f.status === 'FAILED' ? cgFailed++ : cgPassed++);
+      core.info(`    ✅  Passed : ${cgPassed}    ❌  Failed : ${cgFailed}    📊  Total : ${cgPassed + cgFailed}`);
+      blank();
+
       cloudGov.forEach(f => {
         if (f.status === 'FAILED') {
           totalFailed += 1;
@@ -247,6 +260,11 @@ async function run() {
     if (scGov.length === 0) {
       core.info('  ℹ️   No custom supply chain policies configured.');
     } else {
+      let scPassed = 0, scFailed = 0;
+      scGov.forEach(f => f.status === 'FAILED' ? scFailed++ : scPassed++);
+      core.info(`    ✅  Passed : ${scPassed}    ❌  Failed : ${scFailed}    📊  Total : ${scPassed + scFailed}`);
+      blank();
+
       scGov.forEach(f => {
         if (f.status === 'FAILED') {
           totalFailed += 1;
