@@ -31834,7 +31834,7 @@ module.exports = parseParams
 /******/ 	
 /************************************************************************/
 var __webpack_exports__ = {};
-const core = __nccwpck_require__(7484);
+const core = __nccwpck_require__(7484); 
 const github = __nccwpck_require__(3228);
 const https = __nccwpck_require__(5692);
 
@@ -31842,12 +31842,11 @@ const SEVERITY_ORDER = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'];
 const SEVERITY_ICON = { CRITICAL: '🔴', HIGH: '🟠', MEDIUM: '🟡', LOW: '🔵' };
 
 function getSeverity(f) {
-  return (f.severity || f.check_severity || '').toUpperCase();
+  return (f.severity || f.check_severity || 'MEDIUM').toUpperCase();
 }
 
-function sevBadge(f) {
-  const s = getSeverity(f);
-  return s ? `${SEVERITY_ICON[s] || '⚪'} ${s}` : '';
+function sevBadge(sevStr) {
+  return sevStr ? `${SEVERITY_ICON[sevStr] || '⚪'} ${sevStr}` : '';
 }
 
 function L(c = '─', n = 72) { return '  ' + c.repeat(n); }
@@ -31883,7 +31882,7 @@ async function run() {
     const repoId = String(ctx.payload.repository?.id || '');
 
     const payload = JSON.stringify({
-      org_id: orgId, repo_name: repoName, branch, commit_sha: sha,
+      org_id: orgId, repo_name: repoName, branch, commit_sha: sha, 
       commit_message: commitMessage, repo_token: repoToken, repo_id: repoId, repo_host: 'github'
     });
 
@@ -31921,19 +31920,19 @@ async function run() {
           let boundary = buffer.indexOf('\n\n');
           while (boundary !== -1) {
             const message = buffer.slice(0, boundary);
-            buffer = buffer.slice(boundary + 2);
-
+            buffer = buffer.slice(boundary + 2); 
+            
             let eventType = 'message';
             let eventData = '';
             for (const line of message.split('\n')) {
               if (line.startsWith('event:')) eventType = line.replace('event:', '').trim();
               else if (line.startsWith('data:')) eventData = line.replace('data:', '').trim();
             }
-
+            
             if (eventData) {
               try {
                 const parsed = JSON.parse(eventData);
-                const actualData = parsed.data;
+                const actualData = parsed.data; 
                 if (eventType === 'accepted') core.info(`  [🚀] ${actualData.message}`);
                 else if (eventType === 'info' || eventType === 'success') core.info(`  [⏳] ${actualData}`);
                 else if (eventType === 'error') core.warning(`  [⚠️] ${actualData.message || actualData}`);
@@ -31941,7 +31940,7 @@ async function run() {
                   core.info('  [✅] Formatting final report...');
                   resolve(actualData);
                 }
-              } catch (e) { }
+              } catch (e) {}
             }
             boundary = buffer.indexOf('\n\n');
           }
@@ -31963,10 +31962,10 @@ async function run() {
     // ── Field paths ───────────────────────────────────────────────────────────
     const secFindings = body.checkov_findings || [];
     const allGovFindings = body.governance_findings || [];
-
+    
     const cloudGov = allGovFindings.filter(f => f.scope === 'cloud');
     const scGov = allGovFindings.filter(f => f.scope === 'supply_chain');
-
+    
     const cveSummary = body.cve_summary || {};
     const cveCriticals = body.cve_criticals || [];
     const sbomSummary = body.sbom_summary || {};
@@ -31975,26 +31974,57 @@ async function run() {
 
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  1. CLOUD INFRASTRUCTURE ADVISOR (Checkov)
+    //  1. CLOUD INFRASTRUCTURE ADVISOR (Grouped & Deduplicated)
     // ══════════════════════════════════════════════════════════════════════════
     heading('1. Cloud Infrastructure Advisor');
     const failedSec = secFindings.filter(f => !f.status || f.status === 'FAILED');
-
+    
     if (failedSec.length === 0) {
       core.info('  🎉  All security checks passed — no infrastructure violations found');
     } else {
-      totalFailed += failedSec.length;
-      failedSec.forEach((f, idx) => {
+      // Group findings by Check ID
+      const groupedSec = {};
+      failedSec.forEach(f => {
+        // Convert CKV_ to SB_
+        const rawId = f.check_id || 'UNKNOWN';
+        const displayId = rawId.replace(/^CKV_/, 'SB_');
+        
+        if (!groupedSec[displayId]) {
+          groupedSec[displayId] = {
+            check_name: f.check_name,
+            severity: getSeverity(f),
+            resources: []
+          };
+        }
+        
+        const loc = [f.file_path || '', f.line_start ? `:${f.line_start}` : ''].join('');
+        groupedSec[displayId].resources.push(`- ${f.resource || 'N/A'} (${loc})`);
+      });
+
+      // Sort by Severity
+      const sortedCheckIds = Object.keys(groupedSec).sort((a, b) => 
+        SEVERITY_ORDER.indexOf(groupedSec[b].severity) - SEVERITY_ORDER.indexOf(groupedSec[a].severity)
+      );
+
+      totalFailed += sortedCheckIds.length;
+
+      sortedCheckIds.forEach((checkId, idx) => {
+        const group = groupedSec[checkId];
         const num = String(idx + 1).padStart(2, '0');
-        const sev = sevBadge(f);
-        const location = [f.file_path || '', f.line_start ? `:${f.line_start}` : ''].join('');
+        const sev = sevBadge(group.severity);
 
         divider();
-        core.info(`  [${num}]  ${f.check_id || 'N/A'}${sev ? `   ${sev}` : ''}`);
+        core.info(`  [${num}]  ${checkId}   ${sev}`);
         divider();
-        core.info(`         Check     : ${f.check_name || 'N/A'}`);
-        core.info(`         Resource  : ${f.resource || 'N/A'}`);
-        core.info(`         File      : ${location || 'N/A'}`);
+        core.info(`         Check     : ${group.check_name || 'N/A'}`);
+        core.info(`         Resources : `);
+        
+        // List up to 5 resources so the console doesn't get spammed, summarize the rest
+        const maxDisplay = 5;
+        group.resources.slice(0, maxDisplay).forEach(r => core.info(`                     ${r}`));
+        if (group.resources.length > maxDisplay) {
+          core.info(`                     ... and ${group.resources.length - maxDisplay} more resources`);
+        }
         blank();
       });
     }
@@ -32003,7 +32033,7 @@ async function run() {
     //  2. CLOUD INFRASTRUCTURE VIOLATIONS (Custom Cloud Policies)
     // ══════════════════════════════════════════════════════════════════════════
     heading('2. Cloud Infrastructure Violations');
-
+    
     if (cloudGov.length === 0) {
       core.info('  ℹ️   No custom cloud policies configured.');
     } else {
@@ -32022,17 +32052,17 @@ async function run() {
     }
 
     // ══════════════════════════════════════════════════════════════════════════
-    //  3. SUPPLY CHAIN ADVISOR (Grype/Syft)
+    //  3. SUPPLY CHAIN ADVISOR
     // ══════════════════════════════════════════════════════════════════════════
     heading('3. Supply Chain Advisor');
-
+    
     const totalPkg = sbomSummary.total_packages || 0;
     const totalVuln = cveSummary.total || 0;
     const fixableVuln = cveSummary.fixable || 0;
 
     core.info(`    📦 Packages Scanned       : ${totalPkg}`);
     core.info(`    🛡️ Total Vulnerabilities  : ${totalVuln} (${fixableVuln} fixes available)`);
-
+    
     if (cveCriticals.length > 0) {
       totalFailed += cveCriticals.length; // Count critical CVEs towards the failure limit
       blank();
@@ -32072,11 +32102,11 @@ async function run() {
     // ══════════════════════════════════════════════════════════════════════════
     blank();
     core.info(L('━'));
-
-    // Simple Check: Does anything exceed the fail threshold?
+    
+    // Check if any grouping triggers a fail state
     const shouldFailSec = failedSec.some(f => SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn));
     const shouldFailGov = allGovFindings.some(f => f.status === 'FAILED' && SEVERITY_ORDER.indexOf(getSeverity(f)) >= SEVERITY_ORDER.indexOf(failOn));
-    const shouldFailSC = cveCriticals.length > 0 && failOn !== 'none'; // Critical CVEs always trigger a pipeline fail if failOn is active
+    const shouldFailSC = cveCriticals.length > 0 && failOn !== 'none';
 
     if (failOn !== 'none' && (shouldFailSec || shouldFailGov || shouldFailSC)) {
       core.setFailed(`❌ SecondBoat found violations at or above the ${failOn} severity threshold.`);
